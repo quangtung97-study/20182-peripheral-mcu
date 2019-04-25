@@ -4,6 +4,8 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
+#include <avr/boot.h>
+#include <avr/eeprom.h>
 
 #define BAUD 115200
 #define UBRNUM (F_CPU / BAUD / 16 - 1)
@@ -14,9 +16,17 @@
 
 #define RET_OK 1
 #define RET_ERROR 0
+#define RET_NONE 0
+
+#define FALSE 0
+#define TRUE 1
 
 #define SEND_DATA_MASK 0x3f
-#define DATA_MASK 0x3f
+#define DATA_MASK 0x7f
+
+#define MSG_TURN_ON 0
+#define MSG_TURN_OFF 1
+#define MSG_PING 2
 
 volatile uint8_t uart_buff[256];
 uint8_t uart_begin = 0;
@@ -25,12 +35,14 @@ volatile uint8_t uart_end = 0;
 uint8_t line[128];
 uint8_t line_len = 0;
 
-uint8_t data[64];
+uint8_t data[128];
 uint8_t data_begin = 0;
 uint8_t data_end = 0;
 
-uint8_t msg[64];
+uint8_t msg[128];
 uint8_t msg_len = 0;
+uint8_t msg_expected_len = 0;
+uint8_t msg_is_reading_header = TRUE;
 
 volatile uint8_t send_data[64];
 uint8_t send_data_begin = 0;
@@ -101,10 +113,9 @@ void send_byte(uint8_t b) {
     send_data_end = (send_data_end + 1) & SEND_DATA_MASK;
 }
 
-void send_array(const uint8_t *a, uint8_t len) {
-    uint8_t i;
-    for (i = 0; i < len; i++)
-        send_byte(a[i]);
+void ping() {
+    send_byte(1);
+    send_byte(MSG_PING);
 }
 
 uint8_t timer0_count = 0;
@@ -112,8 +123,7 @@ ISR(TIMER0_OVF_vect) {
     timer0_count++;
     if (timer0_count == 30) {
         timer0_count = 0;
-        send_byte('m');
-        send_byte('e');
+        ping();
     }
 }
 
@@ -200,7 +210,8 @@ inline uint8_t send_data_len(uint8_t end) {
     return (end - send_data_begin) & SEND_DATA_MASK;
 }
 
-void handle_tcp_recv();
+uint8_t handle_tcp_recv();
+void loop_handle_tcp_recv();
 
 inline void cmd_AT_CIPSEND(uint8_t end) {
     uint8_t len = send_data_len(end);
@@ -215,15 +226,14 @@ inline void cmd_AT_CIPSEND(uint8_t end) {
     }
     uart_send_string_flash(CRLF);
 
-    while (uart_begin == uart_end) {}
-    handle_tcp_recv();
+    loop_handle_tcp_recv();
 
     uint8_t ret = read_until_ok_error();
     if (ret == RET_ERROR) 
         reset();
 
-    uart_pick();
-    uart_pick();
+    uart_pick(); // Character '>'
+    uart_pick(); // Character ' '
 
     while (send_data_begin != end)
         uart_send(send_data_pick());
@@ -235,41 +245,76 @@ inline void cmd_AT_CIPSEND(uint8_t end) {
     }
 }
 
+void handle_msg() {
+    uint8_t type = msg[0];
+    switch (type) {
+        case MSG_TURN_ON:
+            PORTC |= (1 << LED3);
+            break;
+
+        case MSG_TURN_OFF:
+            PORTC &= ~(1 << LED3);
+            break;
+
+        default:
+            break;
+    }
+}
+
 void handle_data() {
     uint8_t len = data_len();
     for (; len != 0; len--) {
         uint8_t e = data_pick();
-        if (e == 'a')
-            PORTC ^= (1 << LED3);
+        if (msg_is_reading_header) {
+            msg_expected_len = e;
+            msg_len = 0;
+            msg_is_reading_header = FALSE;
+        }
+        else {
+            msg[msg_len++] = e;
+            if (msg_len == msg_expected_len) {
+                handle_msg();
+                msg_is_reading_header = TRUE;
+            }
+        }
     }
 }
 
-void handle_tcp_recv() {
-    while (uart_begin != uart_end) {
-        uint8_t ch = uart_buff[uart_begin];
-        if (ch == '\r') {
-            while (1) {
-                ch = uart_pick();
-                if (ch == ',')
-                    break;
-            }
-
-            uint8_t number = 0;
-            while (1) {
-                ch = uart_pick();
-                if (ch == ':')
-                    break;
-                number *= 10;
-                number += ch - '0';
-            }
-            for (; number != 0; number--) {
-                data_put(uart_pick());
-            }
-            handle_data();
+uint8_t handle_tcp_recv() {
+    uint8_t ch = uart_buff[uart_begin];
+    if (ch == '\r') {
+        while (1) {
+            ch = uart_pick();
+            if (ch == ',')
+                break;
         }
-        else
-            break;
+
+        uint8_t number = 0;
+        while (1) {
+            ch = uart_pick();
+            if (ch == ':')
+                break;
+            number *= 10;
+            number += ch - '0';
+        }
+        for (; number != 0; number--) {
+            data_put(uart_pick());
+        }
+        handle_data();
+
+        return RET_OK;
     }
+    else {
+        return RET_NONE;
+    }
+}
+
+void loop_handle_tcp_recv() {
+    uint8_t ret;
+    do {
+        while (uart_begin == uart_end) {}
+        ret = handle_tcp_recv();
+    } while (ret == RET_OK);
 }
 
 inline void twinkling_led() {
@@ -299,7 +344,9 @@ int main() {
     wdt_reset();
 
     while (1) {
-        handle_tcp_recv();
+        if (uart_begin != uart_end) {
+            handle_tcp_recv();
+        }
 
         if (send_data_begin != send_data_end) {
             cmd_AT_CIPSEND(send_data_end);
