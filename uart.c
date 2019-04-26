@@ -54,7 +54,7 @@ const uint8_t ERROR[] PROGMEM = "ERROR\r\n";
 const uint8_t SEND_OK[] PROGMEM = "SEND OK\r\n";
 const uint8_t AT[] PROGMEM = "AT\r\n";
 const uint8_t AT_CIPCLOSE[] PROGMEM = "AT+CIPCLOSE\r\n";
-const uint8_t AT_CIPSTART[] PROGMEM = "AT+CIPSTART=\"TCP\",\"192.168.1.174\",5555\r\n";
+const uint8_t AT_CIPSTART[] PROGMEM = "AT+CIPSTART=\"TCP\",\"192.168.43.181\",5555\r\n";
 const uint8_t AT_CIPSEND[] PROGMEM = "AT+CIPSEND=";
 
 uint8_t strcmp_flash(
