@@ -24,9 +24,10 @@
 #define SEND_DATA_MASK 0x3f
 #define DATA_MASK 0x7f
 
-#define MSG_TURN_ON 0
-#define MSG_TURN_OFF 1
 #define MSG_PING 2
+#define MSG_REQUEST_PAGE 3
+#define MSG_RECV_PAGE 4
+#define MSG_START_BOOT 5
 
 volatile uint8_t uart_buff[256];
 uint8_t uart_begin = 0;
@@ -79,6 +80,13 @@ inline void init_uart() {
     UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);
 }
 
+inline void revert_init_uart() {
+    UBRRH = 0;
+    UBRRL = 0;
+    UCSRB = 0;
+    UCSRC = (1 << URSEL);
+}
+
 ISR(USART_RXC_vect) {
     uint8_t data = UDR;
     uart_buff[uart_end++] = data;
@@ -113,7 +121,28 @@ void send_byte(uint8_t b) {
     send_data_end = (send_data_end + 1) & SEND_DATA_MASK;
 }
 
-void ping() {
+void msg_start_boot() {
+    send_byte(1);
+    send_byte(MSG_START_BOOT);
+}
+
+void msg_request_page() {
+    send_byte(2);
+    send_byte(MSG_REQUEST_PAGE);
+    send_byte(SPM_PAGESIZE);
+}
+
+inline void move_ivt_bootloader() {
+    GICR = (1 << IVCE);
+	GICR = (1 << IVSEL);
+}
+
+inline void move_ivt_application() {
+    GICR = (1 << IVCE);
+	GICR = 0;
+}
+
+inline void ping() {
     send_byte(1);
     send_byte(MSG_PING);
 }
@@ -135,10 +164,25 @@ inline void init() {
     wdt_enable(WDTO_2S);
     wdt_reset();
 
-    TIMSK = (1 << TOIE0);
     TCCR0 = 0b00000101;
+    TIMSK = (1 << TOIE0);
+
+    move_ivt_bootloader();
 
     sei();
+}
+
+inline void revert_init() {
+    cli();
+
+    move_ivt_application();
+
+    TIMSK = 0;
+    TCCR0 = 0;
+
+    DDRC = 0;
+
+    revert_init_uart();
 }
 
 void readline() {
@@ -245,15 +289,52 @@ inline void cmd_AT_CIPSEND(uint8_t end) {
     }
 }
 
+#define APP_CODE_SIZE (6 * 1024)
+uint16_t page_addr = 0;
+
+void start_app() {
+	asm("eor R30, R30");
+	asm("eor R31, R31");
+	asm("ijmp");
+}
+
+inline void revert_init();
+
+inline void write_spm_page() {
+    eeprom_busy_wait();
+
+    boot_page_erase(page_addr);
+    boot_spm_busy_wait();
+
+    uint8_t i;
+    for (i = 0; i < SPM_PAGESIZE; i += 2) {
+        uint16_t w = msg[i + 2];
+        w <<= 8;
+        w |= msg[i + 1];
+
+        boot_page_fill(page_addr + i, w);
+    }
+
+    boot_page_write(page_addr);
+    boot_spm_busy_wait();
+
+    page_addr += SPM_PAGESIZE;
+
+    if (page_addr == APP_CODE_SIZE) {
+        boot_rww_enable();
+        revert_init();
+        start_app();
+    }
+    else {
+        msg_request_page();
+    }
+}
+
 void handle_msg() {
     uint8_t type = msg[0];
     switch (type) {
-        case MSG_TURN_ON:
-            PORTC |= (1 << LED3);
-            break;
-
-        case MSG_TURN_OFF:
-            PORTC &= ~(1 << LED3);
+        case MSG_RECV_PAGE:
+            write_spm_page();
             break;
 
         default:
@@ -340,6 +421,11 @@ int main() {
     cmd_AT_CIPSTART();
 
     PORTC |= (1 << LED2);
+
+    wdt_reset();
+
+    msg_start_boot();
+    msg_request_page();
 
     wdt_reset();
 
